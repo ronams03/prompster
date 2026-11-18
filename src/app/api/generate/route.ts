@@ -24,8 +24,8 @@ Respond with ONLY one valid JSON object (no markdown fences, no commentary befor
 }
 
 Hard rules:
-- 1 to 3 files total; ALWAYS include at least one 'reference/*.md' file; each file content under 3500 characters.
-- skillMd total length between 1500 and 4500 characters.
+- 1 to 2 files total; ALWAYS include at least one 'reference/*.md' file; each file content under 2500 characters.
+- skillMd total length between 1500 and 3200 characters.
 - All JSON string values must be properly escaped so the JSON parses (newlines as \\n, quotes as \\").
 - Write the skill content in the same language as the user's request.
 - Be extremely concrete and technical. No filler.`;

@@ -45,6 +45,32 @@ const FORGE_STATUS = [
   "RUNNING SLOP DETECTION… 0.00%",
 ];
 
+/** Error returned by the API itself (JSON, res.ok === false) — not worth retrying. */
+class ForgeApiError extends Error {}
+
+/** One strike at the forge API. Throws LINK_SEVERED when we get HTML/garbage instead of JSON. */
+async function forgeOnce(value: string, signal: AbortSignal): Promise<SkillData> {
+  const res = await fetch("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: value }),
+    signal,
+  });
+  const contentType = res.headers.get("content-type") ?? "";
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  if (!contentType.includes("application/json")) {
+    throw new Error("LINK_SEVERED");
+  }
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ForgeApiError(String(data?.error ?? "THE FOUNDRY JAMMED"));
+  }
+  if (!data?.skill) {
+    throw new ForgeApiError("EMPTY CRUCIBLE — the forge returned no skill.");
+  }
+  return data.skill as SkillData;
+}
+
 const STEPS = [
   {
     n: "01",
@@ -94,6 +120,7 @@ export default function Home() {
   const [statusIdx, setStatusIdx] = useState(0);
   const [skill, setSkill] = useState<SkillData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const [tab, setTab] = useState("md");
   const [activeFile, setActiveFile] = useState(0);
   const [zipping, setZipping] = useState(false);
@@ -124,23 +151,56 @@ export default function Home() {
     setLoading(true);
     setProgress(6);
     setStatusIdx(0);
+    setRetrying(false);
     setError(null);
+
+    // hard ceiling so the UI never hangs forever on a dead link
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 150_000);
+
     try {
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: value }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(String(data?.error ?? "THE FOUNDRY JAMMED"));
+      let forged: SkillData | null = null;
+      let failure = "THE FOUNDRY JAMMED — unknown fault. Strike again.";
+
+      // one automatic re-strike when the link blips (HTML error page / dropped JSON)
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          forged = await forgeOnce(value, controller.signal);
+        } catch (e) {
+          if (e instanceof DOMException && e.name === "AbortError") {
+            failure =
+              "FORGE TIMEOUT — 150s elapsed without a result. Try a shorter, sharper prompt and strike again.";
+            break;
+          }
+          if (e instanceof ForgeApiError) {
+            failure = e.message;
+            break; // API said no — retrying changes nothing
+          }
+          if (e instanceof Error && e.message === "LINK_SEVERED") {
+            failure =
+              "FOUNDRY LINK SEVERED — the server dropped mid-forge.";
+          } else if (e instanceof SyntaxError) {
+            failure =
+              "FOUNDRY LINK SEVERED — the response was cut off mid-forge.";
+          } else if (e instanceof Error) {
+            failure = e.message;
+          }
+          if (attempt < 2) {
+            setRetrying(true);
+            await new Promise((r) => setTimeout(r, 1800));
+            setRetrying(false);
+          }
+        }
       }
-      setSkill(data.skill as SkillData);
+
+      if (!forged) throw new Error(failure);
+
+      setSkill(forged);
       setTab("md");
       setActiveFile(0);
       toast({
         title: "SKILL FORGED",
-        description: `${data.skill.name} is hot and ready to ship.`,
+        description: `${forged.name} is hot and ready to ship.`,
       });
       window.setTimeout(
         () => outputRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
@@ -151,6 +211,8 @@ export default function Home() {
     } finally {
       setLoading(false);
       setProgress(0);
+      setRetrying(false);
+      window.clearTimeout(timer);
     }
   }, [prompt, loading, toast]);
 
@@ -176,7 +238,10 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ skill }),
       });
-      if (!res.ok) throw new Error("ZIP PRESS FAILED");
+      const contentType = res.headers.get("content-type") ?? "";
+      if (!res.ok || !contentType.includes("application/zip")) {
+        throw new Error("ZIP PRESS FAILED");
+      }
       const blob = await res.blob();
       saveBlob(`${skill.name}-skill-pack.zip`, blob);
       toast({ title: "ZIP PACK SHIPPED", description: `${skill.name}-skill-pack.zip downloaded.` });
@@ -447,7 +512,11 @@ export default function Home() {
             {loading && (
               <div className="mt-6 border-[3px] border-forge-lime p-4">
                 <div className="flex items-center justify-between gap-4 font-mono text-[11px] font-bold tracking-widest text-forge-lime">
-                  <span className="blink">{FORGE_STATUS[statusIdx]}</span>
+                  <span className="blink">
+                    {retrying
+                      ? "LINK BLIPPED — RE-STRIKING AUTOMATICALLY…"
+                      : FORGE_STATUS[statusIdx]}
+                  </span>
                   <span>{Math.floor(progress)}%</span>
                 </div>
                 <div className="mt-3 h-4 border-2 border-forge-lime bg-forge-ink">
