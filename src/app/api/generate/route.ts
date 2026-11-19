@@ -30,7 +30,7 @@ Hard rules:
 - Write the skill content in the same language as the user's request.
 - Be extremely concrete and technical. No filler.`;
 
-type ChatMessage = { role: "system" | "user"; content: string };
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 function buildMessages(prompt: string): ChatMessage[] {
   return [
@@ -91,7 +91,7 @@ async function callOpenAICompatible(opts: {
       temperature: 0.8,
       ...opts.extraBody,
     }),
-    signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 110_000),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -112,15 +112,28 @@ async function callOpenAICompatible(opts: {
  * text.pollinations.ai speaks the OpenAI chat-completions protocol anonymously
  * (endpoint path is /openai, not /chat/completions).
  */
-async function callPollinationsPost(messages: ChatMessage[]): Promise<string> {
-  return callOpenAICompatible({
-    baseUrl: "https://text.pollinations.ai",
-    path: "/openai",
-    apiKey: process.env.POLLINATIONS_API_KEY,
-    model: process.env.POLLINATIONS_MODEL || "openai",
-    messages,
-    extraBody: { referrer: "skill-foundry", private: true },
-  });
+async function callPollinationsPost(
+  messages: ChatMessage[],
+  allowRateLimitWait = true
+): Promise<string> {
+  try {
+    return await callOpenAICompatible({
+      baseUrl: "https://text.pollinations.ai",
+      path: "/openai",
+      apiKey: process.env.POLLINATIONS_API_KEY,
+      model: process.env.POLLINATIONS_MODEL || "openai",
+      messages,
+      extraBody: { referrer: "skill-foundry", private: true, max_tokens: 8192 },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Anonymous tier: "1 reply every 45 seconds per IP". Wait out the window once.
+    if (allowRateLimitWait && msg.includes("402") && msg.includes("FREE_LIMIT")) {
+      await new Promise((r) => setTimeout(r, 46_000));
+      return callPollinationsPost(messages, false);
+    }
+    throw e;
+  }
 }
 
 /** Second-chance keyless call via Pollinations' plain-text GET endpoint. */
@@ -128,7 +141,8 @@ const GET_SYSTEM_HINT =
   "You are SKILL FOUNDRY, an agent-skill architect. Reply with ONLY one valid minified JSON object with keys: name (kebab-case), title, emoji, description, whenToUse, tags (array), overview, skillMd (full SKILL.md with YAML frontmatter), files (array of {path, content}, include one reference/*.md). No prose, no markdown fences.";
 
 async function callPollinationsGet(messages: ChatMessage[]): Promise<string> {
-  const user = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+  // Always forge from the ORIGINAL user prompt (ignore nudge traffic).
+  const user = messages.find((m) => m.role === "user")?.content ?? "";
   const model = encodeURIComponent(process.env.POLLINATIONS_MODEL || "openai");
   const url =
     `https://text.pollinations.ai/${encodeURIComponent(user)}` +
@@ -137,7 +151,7 @@ async function callPollinationsGet(messages: ChatMessage[]): Promise<string> {
     `&referrer=skill-foundry&private=true`;
   const res = await fetch(url, {
     method: "GET",
-    signal: AbortSignal.timeout(90_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(`pollinations GET ${res.status}`);
   const text = await res.text();
@@ -163,10 +177,15 @@ async function callZaiSdk(messages: ChatMessage[]): Promise<string> {
   const factory = (mod as unknown as { default: { create: () => Promise<ZaiLike> } })
     .default;
   const zai = await factory.create();
-  const completion = await zai.chat.completions.create({
-    messages,
-    thinking: { type: "disabled" },
-  });
+  const completion = await Promise.race([
+    zai.chat.completions.create({
+      messages,
+      thinking: { type: "disabled" },
+    }),
+    new Promise<never>((_, rej) =>
+      setTimeout(() => rej(new Error("z-ai SDK timeout")), 45_000)
+    ),
+  ]);
   const content = completion.choices?.[0]?.message?.content ?? "";
   if (!String(content).trim()) throw new Error("z-ai SDK returned an empty completion");
   return String(content);
@@ -174,10 +193,10 @@ async function callZaiSdk(messages: ChatMessage[]): Promise<string> {
 
 interface Provider {
   name: string;
-  run: () => Promise<string>;
+  run: (messages: ChatMessage[]) => Promise<string>;
 }
 
-function buildProviders(messages: ChatMessage[]): Provider[] {
+function buildProviders(): Provider[] {
   const providers: Provider[] = [];
 
   // 1) OPTIONAL bring-your-own key (set as env vars on Vercel for higher quality).
@@ -212,19 +231,59 @@ function buildProviders(messages: ChatMessage[]): Provider[] {
       const model = process.env[src.modelEnv] || src.fallbackModel;
       providers.push({
         name: src.env,
-        run: () => callOpenAICompatible({ baseUrl: src.baseUrl, apiKey, model, messages }),
+        run: (messages) =>
+          callOpenAICompatible({ baseUrl: src.baseUrl, apiKey, model, messages }),
       });
     }
   }
 
   // 2) Free public keyless API — the default engine everywhere (incl. Vercel).
-  providers.push({ name: "pollinations", run: () => callPollinationsPost(messages) });
-  providers.push({ name: "pollinations-get", run: () => callPollinationsGet(messages) });
+  providers.push({
+    name: "pollinations",
+    run: (messages) => callPollinationsPost(messages),
+  });
+  providers.push({
+    name: "pollinations-get",
+    run: (messages) => callPollinationsGet(messages),
+  });
 
   // 3) Last-resort sandbox SDK.
-  providers.push({ name: "z-ai-sdk", run: () => callZaiSdk(messages) });
+  providers.push({ name: "z-ai-sdk", run: (messages) => callZaiSdk(messages) });
 
   return providers;
+}
+
+/**
+ * Run a provider; if it replies but the payload won't parse as JSON, retry once
+ * with a correction nudge (the model sees its own bad output and fixes it).
+ */
+async function runWithJsonNudge(
+  provider: Provider,
+  messages: ChatMessage[]
+): Promise<{ parsed: unknown | null; error?: string }> {
+  try {
+    let raw = await provider.run(messages);
+    let parsed = extractJsonObject(raw);
+    if (parsed) return { parsed };
+
+    const nudged: ChatMessage[] = [
+      ...messages,
+      { role: "assistant", content: raw.slice(0, 10_000) },
+      {
+        role: "user",
+        content:
+          "Your response above was NOT valid JSON — it could not be parsed. Rebuild the exact same skill as ONE valid JSON object. Output ONLY the JSON object: no prose, no markdown fences, all strings properly escaped.",
+      },
+    ];
+    raw = await provider.run(nudged);
+    parsed = extractJsonObject(raw);
+    return { parsed };
+  } catch (err) {
+    return {
+      parsed: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export async function POST(req: Request) {
@@ -247,26 +306,23 @@ export async function POST(req: Request) {
     }
 
     const messages = buildMessages(prompt);
-    const providers = buildProviders(messages);
+    const providers = buildProviders();
     const failures: string[] = [];
 
     for (const provider of providers) {
-      try {
-        const raw = await provider.run();
-        const parsed = extractJsonObject(raw);
-        const skill = parsed ? sanitizeSkill(parsed) : null;
-        if (skill) {
-          return NextResponse.json(
-            { skill, engine: provider.name },
-            { status: 200 }
-          );
-        }
-        failures.push(`${provider.name}: unparsable JSON payload`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`${provider.name}: ${msg.slice(0, 140)}`);
-        console.error(`[/api/generate] ${provider.name} failed:`, msg);
+      const { parsed, error } = await runWithJsonNudge(provider, messages);
+      const skill = parsed ? sanitizeSkill(parsed) : null;
+      if (skill) {
+        return NextResponse.json(
+          { skill, engine: provider.name },
+          { status: 200 }
+        );
       }
+      const why = error
+        ? `${provider.name}: ${error.slice(0, 140)}`
+        : `${provider.name}: unparsable JSON payload`;
+      failures.push(why);
+      console.error(`[/api/generate] ${why}`);
     }
 
     return NextResponse.json(

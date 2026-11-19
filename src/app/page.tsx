@@ -48,27 +48,75 @@ const FORGE_STATUS = [
 /** Error returned by the API itself (JSON, res.ok === false) — not worth retrying. */
 class ForgeApiError extends Error {}
 
-/** One strike at the forge API. Throws LINK_SEVERED when we get HTML/garbage instead of JSON. */
-async function forgeOnce(value: string, signal: AbortSignal): Promise<SkillData> {
+/** One strike at the forge API. Consumes the NDJSON event stream (ping/progress/done/error). */
+async function forgeOnce(
+  value: string,
+  signal: AbortSignal,
+  onChars: (total: number) => void
+): Promise<SkillData> {
   const res = await fetch("/api/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prompt: value }),
     signal,
   });
-  const contentType = res.headers.get("content-type") ?? "";
-  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-  if (!contentType.includes("application/json")) {
-    throw new Error("LINK_SEVERED");
-  }
-  const data = await res.json();
   if (!res.ok) {
-    throw new ForgeApiError(String(data?.error ?? "THE FOUNDRY JAMMED"));
+    // API-level error (4xx/5xx, plain JSON)
+    let msg = "THE FOUNDRY JAMMED — the forge refused the strike.";
+    try {
+      const j = await res.json();
+      if (j?.error) msg = String(j.error);
+    } catch {
+      /* non-JSON body */
+    }
+    throw new ForgeApiError(msg);
   }
-  if (!data?.skill) {
-    throw new ForgeApiError("EMPTY CRUCIBLE — the forge returned no skill.");
+  if (!res.body) throw new Error("LINK_SEVERED");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let forged: SkillData | null = null;
+  let streamError: string | null = null;
+
+  const handleLine = (line: string) => {
+    const t = line.trim();
+    if (!t) return;
+    let evt: {
+      t?: string;
+      chars?: number;
+      skill?: SkillData;
+      error?: string;
+    };
+    try {
+      evt = JSON.parse(t);
+    } catch {
+      return; // stray non-JSON bytes (e.g. a proxy error page) — ignore
+    }
+    if (evt.t === "progress" && typeof evt.chars === "number") {
+      onChars(evt.chars);
+    } else if (evt.t === "done" && evt.skill) {
+      forged = evt.skill;
+    } else if (evt.t === "error" && evt.error) {
+      streamError = evt.error;
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      handleLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
   }
-  return data.skill as SkillData;
+  if (buf.trim()) handleLine(buf);
+
+  if (forged) return forged;
+  if (streamError) throw new ForgeApiError(streamError);
+  throw new Error("LINK_SEVERED");
 }
 
 const STEPS = [
@@ -121,6 +169,7 @@ export default function Home() {
   const [skill, setSkill] = useState<SkillData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [forgedChars, setForgedChars] = useState(0);
   const [tab, setTab] = useState("md");
   const [activeFile, setActiveFile] = useState(0);
   const [zipping, setZipping] = useState(false);
@@ -152,24 +201,31 @@ export default function Home() {
     setProgress(6);
     setStatusIdx(0);
     setRetrying(false);
+    setForgedChars(0);
     setError(null);
 
     // hard ceiling so the UI never hangs forever on a dead link
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 150_000);
+    const timer = window.setTimeout(() => controller.abort(), 210_000);
 
     try {
       let forged: SkillData | null = null;
       let failure = "THE FOUNDRY JAMMED — unknown fault. Strike again.";
 
-      // one automatic re-strike when the link blips (HTML error page / dropped JSON)
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      // live byte counter from the forge stream — real progress, not vibes
+      const onChars = (chars: number) => {
+        setForgedChars(chars);
+        setProgress((p) => Math.max(p, Math.min(94, 8 + chars / 24)));
+      };
+
+      // up to two automatic re-strikes when the link blips (HTML error page / dropped JSON)
+      for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          forged = await forgeOnce(value, controller.signal);
+          forged = await forgeOnce(value, controller.signal, onChars);
         } catch (e) {
           if (e instanceof DOMException && e.name === "AbortError") {
             failure =
-              "FORGE TIMEOUT — 150s elapsed without a result. Try a shorter, sharper prompt and strike again.";
+              "FORGE TIMEOUT — 210s elapsed without a result. Try a shorter, sharper prompt and strike again.";
             break;
           }
           if (e instanceof ForgeApiError) {
@@ -178,16 +234,17 @@ export default function Home() {
           }
           if (e instanceof Error && e.message === "LINK_SEVERED") {
             failure =
-              "FOUNDRY LINK SEVERED — the server dropped mid-forge.";
+              "FOUNDRY LINK SEVERED — the server dropped mid-forge. Give it a few seconds (it may be waking up), then strike again.";
           } else if (e instanceof SyntaxError) {
             failure =
-              "FOUNDRY LINK SEVERED — the response was cut off mid-forge.";
+              "FOUNDRY LINK SEVERED — the response was cut off mid-forge. Strike again.";
           } else if (e instanceof Error) {
             failure = e.message;
           }
-          if (attempt < 2) {
+          if (attempt < 3) {
             setRetrying(true);
-            await new Promise((r) => setTimeout(r, 1800));
+            // widen the backoff: 1.8s, then 4s — covers a server mid-restart
+            await new Promise((r) => setTimeout(r, attempt === 1 ? 1800 : 4000));
             setRetrying(false);
           }
         }
@@ -212,6 +269,7 @@ export default function Home() {
       setLoading(false);
       setProgress(0);
       setRetrying(false);
+      setForgedChars(0);
       window.clearTimeout(timer);
     }
   }, [prompt, loading, toast]);
@@ -515,7 +573,9 @@ export default function Home() {
                   <span className="blink">
                     {retrying
                       ? "LINK BLIPPED — RE-STRIKING AUTOMATICALLY…"
-                      : FORGE_STATUS[statusIdx]}
+                      : `${FORGE_STATUS[statusIdx]}${
+                          forgedChars > 0 ? ` · ${forgedChars} CHARS` : ""
+                        }`}
                   </span>
                   <span>{Math.floor(progress)}%</span>
                 </div>

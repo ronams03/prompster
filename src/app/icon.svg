@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- SKILL FOUNDRY mark: black tile, hard orange offset, lime hammer -->
+  <rect x="4" y="4" width="58" height="58" rx="9" fill="#FF5C1F"/>
+  <rect x="1" y="1" width="58" height="58" rx="9" fill="#101010"/>
+  <g transform="rotate(-20 30 30)" fill="#BFF747">
+    <rect x="15" y="14" width="26" height="11" rx="2"/>
+    <rect x="25" y="23" width="5" height="24" rx="1.5"/>
+  </g>
+  <circle cx="47" cy="19" r="2.5" fill="#FFD84D"/>
+</svg>
