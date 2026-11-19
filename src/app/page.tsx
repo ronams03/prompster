@@ -14,6 +14,7 @@ import {
   FileText,
   FileJson,
   FileArchive,
+  Package,
   ArrowDown,
 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -136,7 +137,7 @@ const STEPS = [
     n: "03",
     icon: PackageOpen,
     title: "PICK YOUR FORMAT",
-    desc: "MD, JSON, ZIP pack or raw code. Copy it or download it.",
+    desc: "MD, JSON, ZIP pack, all-in-one archive or raw code. Copy it or download it.",
   },
   {
     n: "04",
@@ -173,6 +174,7 @@ export default function Home() {
   const [tab, setTab] = useState("md");
   const [activeFile, setActiveFile] = useState(0);
   const [zipping, setZipping] = useState(false);
+  const [zippingAll, setZippingAll] = useState(false);
   const [copied, setCopied] = useState(false);
   const [devOpen, setDevOpen] = useState(false);
 
@@ -310,6 +312,32 @@ export default function Home() {
     }
   }, [skill, toast]);
 
+  const handleDownloadAllZip = useCallback(async () => {
+    if (!skill) return;
+    setZippingAll(true);
+    try {
+      const res = await fetch("/api/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skill, format: "all" }),
+      });
+      const contentType = res.headers.get("content-type") ?? "";
+      if (!res.ok || !contentType.includes("application/zip")) {
+        throw new Error("ALL-IN-ONE PRESS FAILED");
+      }
+      const blob = await res.blob();
+      saveBlob(`${skill.name}-all-in-one.zip`, blob);
+      toast({
+        title: "ALL-IN-ONE SHIPPED",
+        description: `${skill.name}-all-in-one.zip — md + json + txt + scripts in one archive.`,
+      });
+    } catch {
+      toast({ title: "PRESS JAMMED", description: "All-in-one press failed — strike it again.", variant: "destructive" });
+    } finally {
+      setZippingAll(false);
+    }
+  }, [skill, toast]);
+
   const handleCopy = useCallback(async () => {
     if (!skill) return;
     try {
@@ -334,7 +362,7 @@ export default function Home() {
       <Ticker
         items={[
           "PROMPT IN → SKILL OUT",
-          "MD · JSON · ZIP · CODE",
+          "MD · JSON · ZIP · ALL-IN-ONE",
           "ZERO SLOP GUARANTEED",
           "AGENT-READY OUTPUT",
           "SKILL FOUNDRY™ EST. 2025",
@@ -398,7 +426,7 @@ export default function Home() {
                   AGENT-READY
                 </Sticker>
                 <Sticker className="-rotate-1 bg-forge-yellow">
-                  4 EXPORT FORMATS
+                  5 EXPORT FORMATS
                 </Sticker>
                 <Sticker className="rotate-2 bg-forge-lime">
                   MAXIMALIST BY DEFAULT
@@ -454,7 +482,7 @@ export default function Home() {
         >
           <div className="mx-auto grid max-w-7xl grid-cols-2 lg:grid-cols-4">
             {[
-              { k: "EXPORT FORMATS", v: "4", note: "MD / JSON / ZIP / CODE" },
+              { k: "EXPORT FORMATS", v: "5", note: "MD / JSON / ZIP / CODE / ALL-IN-ONE" },
               { k: "FILES PER PACK", v: "∞", note: "SKILL.MD + REFERENCES" },
               { k: "SLOP DETECTED", v: "0%", note: "LAB-TESTED DAILY" },
               { k: "FORGE POWER", v: "9000", note: "CAPACITY UNITS ⚡" },
@@ -815,6 +843,15 @@ export default function Home() {
                       </button>
                       <button
                         type="button"
+                        onClick={handleDownloadAllZip}
+                        disabled={zippingAll}
+                        className="inline-flex items-center gap-2 border-[3px] border-forge-ink bg-forge-magenta px-4 py-2.5 font-display text-sm text-forge-paper shadow-[4px_4px_0_0_var(--color-forge-ink)] transition-all hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_0_var(--color-forge-ink)] active:translate-x-[4px] active:translate-y-[4px] active:shadow-none disabled:opacity-50"
+                      >
+                        <Package className="h-4 w-4" strokeWidth={2.5} />
+                        {zippingAll ? "PRESSING…" : "ALL-IN-ONE .ZIP"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={handleCopy}
                         className="inline-flex items-center gap-2 border-[3px] border-forge-ink bg-forge-ink px-4 py-2.5 font-display text-sm text-forge-lime shadow-[4px_4px_0_0_var(--color-forge-magenta)] transition-all hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_0_var(--color-forge-magenta)] active:translate-x-[4px] active:translate-y-[4px] active:shadow-none"
                       >
@@ -827,7 +864,7 @@ export default function Home() {
                       </button>
                     </div>
                     <p className="ml-auto hidden font-mono text-[10px] tracking-[0.25em] text-forge-ink/60 lg:block">
-                      ZIP = SKILL.MD + FILES + MANIFEST
+                      ALL-IN-ONE = MD + JSON + TXT + SCRIPTS · ONE ARCHIVE
                     </p>
                   </div>
                 </div>

@@ -35,6 +35,15 @@ mkdir -p "$BUILD_DIR"
 echo "📦 安装依赖..."
 bun install
 
+# 沙箱专用前置：停掉运行中的 dev server 并清空 .next，
+# 避免开发进程与生产构建争抢同一目录导致 Turbopack/webpack 缓存失效 panic。
+# （Vercel 等外部环境没有 dev server，package.json 的 build 不含此逻辑）
+echo "🛑 停止运行中的 dev server（如无则跳过）..."
+pkill -f 'next dev' 2>/dev/null || true
+pkill -f 'next-server' 2>/dev/null || true
+sleep 1
+rm -rf "$NEXTJS_PROJECT_DIR/.next"
+
 # 构建 Next.js 应用
 echo "🔨 构建 Next.js 应用..."
 bun run build
