@@ -30,7 +30,7 @@ Hard rules:
 - Write the skill content in the same language as the user's request.
 - Be extremely concrete and technical. No filler.`;
 
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+type ChatMessage = { role: "system" | "user"; content: string };
 
 function buildMessages(prompt: string): ChatMessage[] {
   return [
@@ -69,90 +69,110 @@ interface OpenAIChatResponse {
   choices?: Array<{ message?: { content?: string | null } }>;
 }
 
-async function callOpenAICompatible(opts: {
-  baseUrl: string;
-  path?: string;
-  apiKey?: string;
-  model: string;
-  messages: ChatMessage[];
-  extraBody?: Record<string, unknown>;
-  timeoutMs?: number;
-}): Promise<string> {
-  const url = `${opts.baseUrl.replace(/\/+$/, "")}${opts.path || "/chat/completions"}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
-    },
-    body: JSON.stringify({
-      model: opts.model,
-      messages: opts.messages,
-      temperature: 0.8,
-      ...opts.extraBody,
-    }),
-    signal: AbortSignal.timeout(opts.timeoutMs ?? 110_000),
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(
-      `provider ${res.status}${detail ? `: ${detail.slice(0, 180)}` : ""}`
-    );
-  }
-  const data = (await res.json()) as OpenAIChatResponse;
-  const content = data?.choices?.[0]?.message?.content ?? "";
-  if (!String(content).trim()) {
-    throw new Error("provider returned an empty completion");
-  }
-  return String(content);
+interface OpenAIStreamChunk {
+  choices?: Array<{
+    delta?: { content?: string | null; reasoning?: string | null };
+  }>;
 }
 
 /**
  * FREE PUBLIC API — no signup, no key. Works locally and on Vercel out of the box.
  * text.pollinations.ai speaks the OpenAI chat-completions protocol anonymously
- * (endpoint path is /openai, not /chat/completions).
+ * (endpoint path is /openai). Streamed so bytes flow continuously and no
+ * proxy/gateway can kill the connection during long generations.
  */
-async function callPollinationsPost(
+async function streamPollinations(
   messages: ChatMessage[],
-  allowRateLimitWait = true
+  signal: AbortSignal,
+  onChars: (total: number) => void
 ): Promise<string> {
-  try {
-    return await callOpenAICompatible({
-      baseUrl: "https://text.pollinations.ai",
-      path: "/openai",
-      apiKey: process.env.POLLINATIONS_API_KEY,
+  const res = await fetch("https://text.pollinations.ai/openai", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(process.env.POLLINATIONS_API_KEY
+        ? { Authorization: `Bearer ${process.env.POLLINATIONS_API_KEY}` }
+        : {}),
+    },
+    body: JSON.stringify({
       model: process.env.POLLINATIONS_MODEL || "openai",
       messages,
-      extraBody: { referrer: "skill-foundry", private: true, max_tokens: 8192 },
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    // Anonymous tier: "1 reply every 45 seconds per IP". Wait out the window once.
-    if (allowRateLimitWait && msg.includes("402") && msg.includes("FREE_LIMIT")) {
-      await new Promise((r) => setTimeout(r, 46_000));
-      return callPollinationsPost(messages, false);
-    }
-    throw e;
+      temperature: 0.8,
+      stream: true,
+      response_format: { type: "json_object" },
+      referrer: "skill-foundry",
+      private: true,
+    }),
+    signal,
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(
+      `pollinations POST ${res.status}${detail ? `: ${detail.slice(0, 140)}` : ""}`
+    );
   }
+  if (!res.body) throw new Error("pollinations returned no stream body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let content = "";
+  let reported = 0;
+
+  const handleSseLine = (line: string) => {
+    const t = line.trim();
+    if (!t.startsWith("data:")) return;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const chunk = JSON.parse(payload) as OpenAIStreamChunk;
+      const delta = chunk?.choices?.[0]?.delta;
+      const piece = delta?.content ?? "";
+      if (typeof piece === "string" && piece) content += piece;
+      // reasoning tokens also prove liveness — count them toward progress
+      const thought = delta?.reasoning ?? "";
+      const total = content.length + thought.length;
+      if (total - reported >= 80) {
+        reported = total;
+        onChars(total);
+      }
+    } catch {
+      /* partial chunk — ignore */
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      handleSseLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  if (buf.trim()) handleSseLine(buf);
+
+  if (!content.trim()) throw new Error("pollinations stream produced no content");
+  return content;
 }
 
 /** Second-chance keyless call via Pollinations' plain-text GET endpoint. */
 const GET_SYSTEM_HINT =
   "You are SKILL FOUNDRY, an agent-skill architect. Reply with ONLY one valid minified JSON object with keys: name (kebab-case), title, emoji, description, whenToUse, tags (array), overview, skillMd (full SKILL.md with YAML frontmatter), files (array of {path, content}, include one reference/*.md). No prose, no markdown fences.";
 
-async function callPollinationsGet(messages: ChatMessage[]): Promise<string> {
-  // Always forge from the ORIGINAL user prompt (ignore nudge traffic).
-  const user = messages.find((m) => m.role === "user")?.content ?? "";
+async function callPollinationsGet(
+  messages: ChatMessage[],
+  signal: AbortSignal
+): Promise<string> {
+  const user = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
   const model = encodeURIComponent(process.env.POLLINATIONS_MODEL || "openai");
   const url =
     `https://text.pollinations.ai/${encodeURIComponent(user)}` +
     `?model=${model}` +
     `&system=${encodeURIComponent(GET_SYSTEM_HINT)}` +
     `&referrer=skill-foundry&private=true`;
-  const res = await fetch(url, {
-    method: "GET",
-    signal: AbortSignal.timeout(60_000),
-  });
+  const res = await fetch(url, { method: "GET", signal });
   if (!res.ok) throw new Error(`pollinations GET ${res.status}`);
   const text = await res.text();
   if (!text.trim()) throw new Error("pollinations GET returned an empty body");
@@ -162,7 +182,10 @@ async function callPollinationsGet(messages: ChatMessage[]): Promise<string> {
 /**
  * Sandbox-only fallback. Unavailable on Vercel — fails fast and quietly there.
  */
-async function callZaiSdk(messages: ChatMessage[]): Promise<string> {
+async function callZaiSdk(
+  messages: ChatMessage[],
+  signal: AbortSignal
+): Promise<string> {
   interface ZaiLike {
     chat: {
       completions: {
@@ -174,29 +197,60 @@ async function callZaiSdk(messages: ChatMessage[]): Promise<string> {
     };
   }
   const mod = await import("z-ai-web-dev-sdk");
-  const factory = (mod as unknown as { default: { create: () => Promise<ZaiLike> } })
-    .default;
+  const factory = (
+    mod as unknown as { default: { create: (opts?: unknown) => Promise<ZaiLike> } }
+  ).default;
   const zai = await factory.create();
-  const completion = await Promise.race([
-    zai.chat.completions.create({
-      messages,
-      thinking: { type: "disabled" },
-    }),
-    new Promise<never>((_, rej) =>
-      setTimeout(() => rej(new Error("z-ai SDK timeout")), 45_000)
-    ),
-  ]);
+  const completion = await zai.chat.completions.create({
+    messages,
+    thinking: { type: "disabled" },
+  });
+  void signal;
   const content = completion.choices?.[0]?.message?.content ?? "";
   if (!String(content).trim()) throw new Error("z-ai SDK returned an empty completion");
   return String(content);
 }
 
-interface Provider {
-  name: string;
-  run: (messages: ChatMessage[]) => Promise<string>;
+/** OpenAI-compatible provider used when the operator brings their own key. */
+async function callOpenAICompatible(opts: {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  messages: ChatMessage[];
+  signal: AbortSignal;
+}): Promise<string> {
+  const url = `${opts.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${opts.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: opts.model,
+      messages: opts.messages,
+      temperature: 0.8,
+    }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(
+      `provider ${res.status}${detail ? `: ${detail.slice(0, 140)}` : ""}`
+    );
+  }
+  const data = (await res.json()) as OpenAIChatResponse;
+  const content = data?.choices?.[0]?.message?.content ?? "";
+  if (!String(content).trim()) throw new Error("provider returned an empty completion");
+  return String(content);
 }
 
-function buildProviders(): Provider[] {
+interface Provider {
+  name: string;
+  run: (signal: AbortSignal, onChars: (total: number) => void) => Promise<string>;
+}
+
+function buildProviders(messages: ChatMessage[]): Provider[] {
   const providers: Provider[] = [];
 
   // 1) OPTIONAL bring-your-own key (set as env vars on Vercel for higher quality).
@@ -231,8 +285,8 @@ function buildProviders(): Provider[] {
       const model = process.env[src.modelEnv] || src.fallbackModel;
       providers.push({
         name: src.env,
-        run: (messages) =>
-          callOpenAICompatible({ baseUrl: src.baseUrl, apiKey, model, messages }),
+        run: (signal) =>
+          callOpenAICompatible({ baseUrl: src.baseUrl, apiKey, model, messages, signal }),
       });
     }
   }
@@ -240,107 +294,121 @@ function buildProviders(): Provider[] {
   // 2) Free public keyless API — the default engine everywhere (incl. Vercel).
   providers.push({
     name: "pollinations",
-    run: (messages) => callPollinationsPost(messages),
+    run: (signal, onChars) => streamPollinations(messages, signal, onChars),
   });
   providers.push({
     name: "pollinations-get",
-    run: (messages) => callPollinationsGet(messages),
+    run: (signal) => callPollinationsGet(messages, signal),
   });
 
   // 3) Last-resort sandbox SDK.
-  providers.push({ name: "z-ai-sdk", run: (messages) => callZaiSdk(messages) });
+  providers.push({ name: "z-ai-sdk", run: (signal) => callZaiSdk(messages, signal) });
 
   return providers;
 }
 
-/**
- * Run a provider; if it replies but the payload won't parse as JSON, retry once
- * with a correction nudge (the model sees its own bad output and fixes it).
- */
-async function runWithJsonNudge(
-  provider: Provider,
-  messages: ChatMessage[]
-): Promise<{ parsed: unknown | null; error?: string }> {
-  try {
-    let raw = await provider.run(messages);
-    let parsed = extractJsonObject(raw);
-    if (parsed) return { parsed };
-
-    const nudged: ChatMessage[] = [
-      ...messages,
-      { role: "assistant", content: raw.slice(0, 10_000) },
-      {
-        role: "user",
-        content:
-          "Your response above was NOT valid JSON — it could not be parsed. Rebuild the exact same skill as ONE valid JSON object. Output ONLY the JSON object: no prose, no markdown fences, all strings properly escaped.",
-      },
-    ];
-    raw = await provider.run(nudged);
-    parsed = extractJsonObject(raw);
-    return { parsed };
-  } catch (err) {
-    return {
-      parsed: null,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
 export async function POST(req: Request) {
-  try {
-    const body = (await req.json().catch(() => null)) as
-      | { prompt?: unknown }
-      | null;
-    const prompt = String(body?.prompt ?? "").trim();
-    if (!prompt) {
-      return NextResponse.json(
-        { error: "PROMPT REQUIRED — the forge does not run on air." },
-        { status: 400 }
-      );
-    }
-    if (prompt.length > 2000) {
-      return NextResponse.json(
-        { error: "PROMPT TOO LONG — max 2000 characters." },
-        { status: 400 }
-      );
-    }
-
-    const messages = buildMessages(prompt);
-    const providers = buildProviders();
-    const failures: string[] = [];
-
-    for (const provider of providers) {
-      const { parsed, error } = await runWithJsonNudge(provider, messages);
-      const skill = parsed ? sanitizeSkill(parsed) : null;
-      if (skill) {
-        return NextResponse.json(
-          { skill, engine: provider.name },
-          { status: 200 }
-        );
-      }
-      const why = error
-        ? `${provider.name}: ${error.slice(0, 140)}`
-        : `${provider.name}: unparsable JSON payload`;
-      failures.push(why);
-      console.error(`[/api/generate] ${why}`);
-    }
-
+  const body = (await req.json().catch(() => null)) as
+    | { prompt?: unknown }
+    | null;
+  const prompt = String(body?.prompt ?? "").trim();
+  if (!prompt) {
     return NextResponse.json(
-      {
-        error:
-          "THE FOUNDRY JAMMED — every AI engine failed or returned garbage. Give it a breath and strike again.",
-        engines: failures,
-      },
-      { status: 502 }
-    );
-  } catch (err) {
-    console.error("[/api/generate] forge failure:", err);
-    return NextResponse.json(
-      {
-        error:
-          "FORGE OVERHEATED — the AI worker failed to respond. Wait a moment and strike again.",
-      },
-      { status: 500 }
+      { error: "PROMPT REQUIRED — the forge does not run on air." },
+      { status: 400 }
     );
   }
+  if (prompt.length > 2000) {
+    return NextResponse.json(
+      { error: "PROMPT TOO LONG — max 2000 characters." },
+      { status: 400 }
+    );
+  }
+
+  const messages = buildMessages(prompt);
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let closed = false;
+      const send = (evt: Record<string, unknown>) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(`${JSON.stringify(evt)}\n`));
+        } catch {
+          closed = true;
+        }
+      };
+      // heartbeat: bytes hit the wire every 2.5s so idle-timeout proxies never
+      // declare the link dead during long generations
+      const pinger = setInterval(() => send({ t: "ping", at: Date.now() }), 2500);
+
+      try {
+        // client gone or 180s hard ceiling — either way stop the upstream work
+        const signal = AbortSignal.any([
+          req.signal,
+          AbortSignal.timeout(180_000),
+        ]);
+        const providers = buildProviders(messages);
+        const failures: string[] = [];
+
+        for (const provider of providers) {
+          if (closed) return;
+          try {
+            const raw = await provider.run(signal, (chars) =>
+              send({ t: "progress", chars })
+            );
+            const parsed = extractJsonObject(raw);
+            const skill = parsed ? sanitizeSkill(parsed) : null;
+            if (skill) {
+              send({ t: "done", skill, engine: provider.name });
+              return;
+            }
+            failures.push(`${provider.name}: unparsable JSON payload`);
+            console.error(`[/api/generate] ${provider.name}: unparsable JSON payload`);
+          } catch (err) {
+            if (signal.aborted) return;
+            const msg = err instanceof Error ? err.message : String(err);
+            failures.push(`${provider.name}: ${msg.slice(0, 140)}`);
+            console.error(`[/api/generate] ${provider.name} failed:`, msg);
+          }
+        }
+
+        send({
+          t: "error",
+          error:
+            "THE FOUNDRY JAMMED — every AI engine failed or returned garbage. Give it a breath and strike again.",
+          engines: failures,
+        });
+      } catch (err) {
+        console.error("[/api/generate] forge failure:", err);
+        send({
+          t: "error",
+          error:
+            "FORGE OVERHEATED — the AI worker failed to respond. Wait a moment and strike again.",
+        });
+      } finally {
+        clearInterval(pinger);
+        if (!closed) {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+        }
+      }
+    },
+    cancel() {
+      // client disconnects are propagated via req.signal into upstream fetches
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
